@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="nb" class="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Varetelling – PWA (énfil, vedvarende lagring)</title>
+  <meta name="theme-color" content="#0B1220" />
+  <meta name="description" content="Månedsavslutt i kaffebar: last opp varetellings-Excel, tell, og eksporter samme fil tilbake. Alt lokalt i nettleseren. Offline-støtte." />
+  <!-- Tailwind (JIT CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: { extend: { colors: { brand: {50:'#eef2ff',100:'#e0e7ff',200:'#c7d2fe',300:'#a5b4fc',400:'#818cf8',500:'#6366f1',600:'#4f46e5',700:'#4338ca',800:'#3730a3',900:'#312e81'} } } }
+    }
+  </script>
+  <!-- React 18 UMD -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Dexie (IndexedDB) -->
+  <script src="https://unpkg.com/dexie@3.2.5/dist/dexie.min.js"></script>
+  <!-- SheetJS -->
+  <script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <style>
+    * { scrollbar-width: thin; scrollbar-color: #4b5563 transparent; }
+    *::-webkit-scrollbar { height: 10px; width: 10px; }
+    *::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 6px; }
+    .no-select { user-select:none; -webkit-user-select:none; }
+    .tap-highlight-none { -webkit-tap-highlight-color: transparent; }
+    /* Skjul små +/- spinnere på number-inputs (pengetelling m.m.) */
+    input[type=number]::-webkit-outer-spin-button,
+    input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    input[type=number] { -moz-appearance: textfield; }
+  </style>
+</head>
+<body class="bg-white text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100 min-h-screen antialiased">
+  <div id="app"></div>
+
+  <script>
+  ;(() => {
+    const { useState, useEffect, useMemo } = React;
+
+    // ------------------------------- PWA (manifest + SW) -------------------------------
+    const manifest = {
+      name: "Varetelling PWA",
+      short_name: "Varetelling",
+      start_url: ".",
+      display: "standalone",
+      background_color: "#0B1220",
+      theme_color: "#0B1220",
+      description: "Månedsavslutt i kaffebar. Alt lokalt.",
+      icons: [
+        { src: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'><rect width='128' height='128' rx='24' fill='%230B1220'/><text x='50%' y='54%' dominant-baseline='middle' text-anchor='middle' font-size='68' fill='%23fff'>☕</text></svg>", sizes: "128x128", type: "image/svg+xml", purpose: "any maskable" }
+      ]
+    };
+    const manifestBlob = new Blob([JSON.stringify(manifest)], {type:'application/manifest+json'});
+    const manifestURL = URL.createObjectURL(manifestBlob);
+    const link = document.createElement('link'); link.rel='manifest'; link.href=manifestURL; document.head.appendChild(link);
+
+    // I canvas hopper vi over SW-registrering (blob: ikke støttet). I prod: bruk '/sw.js' over HTTPS.
+    (function registerSWSafely(){
+      const IS_HTTPS = location.protocol === 'https:';
+      const IS_SANDBOX = /oaiusercontent\.com|localhost\.oai/.test(location.hostname);
+      if ('serviceWorker' in navigator && IS_HTTPS && !IS_SANDBOX) {
+        navigator.serviceWorker.register('/sw.js').catch(()=>{});
+      }
+    })();
+
+    // ------------------------------- Dexie (IndexedDB) -------------------------------
+    const db = new Dexie('varetelling_db');
+    // Vi beholder samme index-definisjon; felter kan likevel utvides dynamisk
+    db.version(3).stores({
+      sessions: '++id, sessionKey, fileName, monthYear, updatedAt',
+      history: '++id, monthYear',
+      meta: '&key'
+    });
+
+    // ------------------------------- Utils -------------------------------
+    const nb = new Intl.NumberFormat('nb-NO');
+    const nowISO = () => new Date().toISOString();
+
+    function fileHashName(file) { return `${file?.name || 'ukjent'}_${file?.size || 0}`; }
+    function normalize(s) { if (!s && s!==0) return ''; return String(s).trim().toUpperCase().replace(/\s+/g,' ').replaceAll('\u00A0',' '); }
+    const isNonEmpty = (x) => x !== undefined && x !== null && String(x).trim() !== '';
+    const isKategoriRow = (art, firstCol) => !isNonEmpty(art) && isNonEmpty(firstCol);
+    const isVareRow = (art) => isNonEmpty(art);
+
+    // Base64 helpers for å lagre original workbook lokalt (for eksport uten re-upload)
+    function ab2b64(ab) {
+      const bytes = new Uint8Array(ab); let bin = '';
+      for (let i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
+      return btoa(bin);
+    }
+    function b642ab(b64) {
+      const bin = atob(b64); const len = bin.length; const bytes = new Uint8Array(len);
+      for (let i=0;i<len;i++) bytes[i] = bin.charCodeAt(i);
+      return bytes.buffer;
+    }
+
+    // Tillat trailing komma/punktum → fyll ut 0 (12, -> 12,0)
+    function parseNbNumber(str) {
+      if (str === undefined || str === null) return undefined;
+      if (typeof str === 'number') return Number.isFinite(str) ? str : undefined;
+      const raw = String(str).replace(/\u00A0/g,' ').trim();
+      if (!raw) return undefined;
+      let cleaned = raw.replace(/\s/g,'');
+      if (!/^-?\d+(?:[,.]\d*)?$/.test(cleaned)) return undefined;
+      if (/[,.]$/.test(cleaned)) cleaned += '0';
+      const num = Number(cleaned.replace(',', '.'));
+      return Number.isFinite(num) ? num : undefined;
+    }
+
+    // ------------------------------- Excel helpers -------------------------------
+    function findHeaderRow(ws) {
+      const range = XLSX.utils.decode_range(ws['!ref'] || 'A1:A1');
+      for (let r = range.s.r; r <= range.e.r; r++) {
+        const cell = ws[XLSX.utils.encode_cell({r, c:0})];
+        if (!cell) continue;
+        if (normalize(cell.v) === 'ANTALL') return r+1; // 1-based
+      }
+      return -1;
+    }
+    function findSheetByName(workbook, preferred) {
+      if (!workbook) return null;
+      let name = workbook.SheetNames.find(n => normalize(n) === normalize(preferred));
+      if (!name && preferred === 'VARETELLINGSLISTE')
+        name = workbook.SheetNames.find(n => normalize(n).includes('VARETELLING'));
+      if (!name) name = workbook.SheetNames[0];
+      return { name, ws: workbook.Sheets[name] };
+    }
+    function buildHeaderMap(ws, headerRow) {
+      const cols = {}; const rowIndex = headerRow-1;
+      const range = XLSX.utils.decode_range(ws['!ref']);
+      for (let c=range.s.c; c<=range.e.c; c++) {
+        const cell = ws[XLSX.utils.encode_cell({r:rowIndex, c})];
+        if (!cell) continue; cols[normalize(cell.v)] = c;
+      }
+      function getIndex(exact, alts=[]) {
+        if (cols[normalize(exact)] !== undefined) return cols[normalize(exact)];
+        for (const a of alts) if (cols[normalize(a)] !== undefined) return cols[normalize(a)];
+        const token = normalize(exact); for (const [k,v] of Object.entries(cols)) if (k.includes(token)) return v;
+        return undefined;
+      }
+      return {
+        colAntall: getIndex('ANTALL'),
+        colArtNr: getIndex('ARTIKKELNR.', ['ARTIKKELNR','ARTIKKEL NR','ARTIKKEL NUMMER']),
+        colNavn: getIndex('VARENAVN', ['VARE','NAVN']),
+        colEnhet: getIndex('FORPAKNINGEN DU SKAL TELLE', ['ENHET','FORPAKNING']),
+        colPakningsinfo: getIndex('HVOR MYE ER DET I FORPAKNINGEN?', ['HVOR MYE','PAKNINGSINFO']),
+        colPrisHavi: getIndex('PRIS HAVI', ['PRIS HAVI','PRIS HAV']),
+        colPrisPer: getIndex('PRIS PER FORPAKNING', ['PRIS','PRIS PER']),
+        colKonto: getIndex('KONTO'),
+        colSum: getIndex('SUM'),
+        possibleInfo: getIndex('INFO', ['INFO:','UTGÅTT','UTGAATT'])
+      };
+    }
+    function parseItems(workbook) {
+      const { name, ws } = findSheetByName(workbook, 'VARETELLINGSLISTE');
+      if (!ws) throw new Error('Fant ikke noen regneark-side i arbeidsboken');
+      const headerRow = findHeaderRow(ws);
+      if (headerRow < 1) throw new Error('Fant ikke header-rad (forventet at første celle i raden er "ANTALL")');
+      const hdr = buildHeaderMap(ws, headerRow);
+      const range = XLSX.utils.decode_range(ws['!ref']);
+      let currentKategori = ''; const items = [];
+      for (let r = headerRow+1; r <= range.e.r+1; r++) {
+        const get = (c) => {
+          if (c===undefined) return undefined;
+          const cell = ws[XLSX.utils.encode_cell({r:r-1, c})];
+          return cell ? cell.v : undefined;
+        };
+        const firstCol = get(0); const art = hdr.colArtNr !== undefined ? get(hdr.colArtNr) : undefined;
+        if (isKategoriRow(art, firstCol)) { currentKategori = String(firstCol).trim(); continue; }
+        if (!isVareRow(art)) continue; // dropp overskrifter/forklaringer
+        const navn = hdr.colNavn !== undefined ? get(hdr.colNavn) : undefined; if (!navn) continue;
+        const enhet = hdr.colEnhet !== undefined ? get(hdr.colEnhet) : '';
+        const pakningsinfo = hdr.colPakningsinfo !== undefined ? get(hdr.colPakningsinfo) : undefined;
+        const prisPer = hdr.colPrisPer !== undefined ? parseNbNumber(get(hdr.colPrisPer)) : undefined;
+        const antallRaw = hdr.colAntall !== undefined ? get(hdr.colAntall) : undefined;
+        const antall = parseNbNumber(antallRaw);
+        const info = hdr.possibleInfo !== undefined ? normalize(get(hdr.possibleInfo)) : '';
+        const utgatt = info.includes('UTG');
+        items.push({
+          rowIndex: r,
+          kategori: currentKategori || '',
+          artikkelnummer: art ? String(art) : '',
+          navn: String(navn || ''),
+          enhet: enhet ? String(enhet) : '',
+          pakningsinfo: pakningsinfo ? String(pakningsinfo) : undefined,
+          prisPerForpakning: Number.isFinite(prisPer) ? prisPer : undefined,
+          antall: Number.isFinite(antall) ? antall : undefined,
+          _utgatt: utgatt
+        });
+      }
+      return { items, sheetName: name, headerRow, headerMap: hdr };
+    }
+    async function applyCountsAndExport(originalWorkbook, countsByRowIndex, sheetName, headerRow, headerMap) {
+      const wb = JSON.parse(JSON.stringify(originalWorkbook));
+      const ws = wb.Sheets[sheetName] || wb.Sheets[wb.SheetNames[0]];
+      if (!ws) throw new Error('Finner ikke arket ved eksport');
+      const antallCol = headerMap.colAntall; if (antallCol === undefined) throw new Error('Fant ikke kolonnen ANTALL ved eksport');
+      for (const [rowStr, value] of Object.entries(countsByRowIndex || {})) {
+        const r = Number(rowStr); if (!Number.isInteger(r)) continue;
+        const addr = XLSX.utils.encode_cell({ r: r-1, c: antallCol });
+        if (value === undefined || value === null || value === '') ws[addr] = { t:'s', v:'' };
+        else ws[addr] = { t:'n', v: Number(value) };
+      }
+      const out = XLSX.write(wb, { bookType:'xlsx', type:'array' });
+      const blob = new Blob([out], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      return new File([blob], 'Varetelling_eksport.xlsx', { type: blob.type });
+    }
+
+    // ------------------------------- CSV helper -------------------------------
+    function exportCSV(filename, rows) {
+      const csv = rows.map(r => r.map(x => {
+        if (x === null || x === undefined) return '';
+        const s = String(x).replaceAll('"','""'); return /[,\"\n]/.test(s) ? `"${s}"` : s;
+      }).join(',')).join('\n');
+      const blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
+      const url = URL.createObjectURL(blob); const a = document.createElement('a');
+      a.href = url; a.download = filename; a.click(); URL.revokeObjectURL(url);
+    }
+
+    // ------------------------------- UI Components -------------------------------
+    function TopBar({dark, setDark, onUploadExcel, onUploadChecklist, fileName, onExport, pricesVisible, setPricesVisible}) {
+      return (
+        React.createElement('div', {className:'sticky top-0 z-20 bg-white/80 dark:bg-zinc-900/80 backdrop-blur border-b border-zinc-200 dark:border-zinc-800'},
+          React.createElement('div', {className:'max-w-6xl mx-auto px-3 py-2 flex gap-2 items-center'},
+            React.createElement('div', {className:'text-lg font-semibold'}, 'Varetelling'),
+            fileName ? React.createElement('div', {className:'text-xs text-zinc-500 dark:text-zinc-400 truncate'}, fileName) : null,
+            React.createElement('div', {className:'ml-auto flex items-center gap-2'},
+              React.createElement('label', {className:'px-3 py-1.5 bg-zinc-100 dark:bg-zinc-800 rounded-xl text-sm cursor-pointer hover:bg-zinc-200 dark:hover:bg-zinc-700'},
+                'Last opp Excel',
+                React.createElement('input', {type:'file', accept:'.xlsx,.xls', className:'hidden', onChange:e=>onUploadExcel(e.target.files?.[0])})
+              ),
+              React.createElement('label', {className:'px-3 py-1.5 bg-zinc-100 dark:bg-zinc-800 rounded-xl text-sm cursor-pointer hover:bg-zinc-200 dark:hover:bg-zinc-700'},
+                'Sjekkliste',
+                React.createElement('input', {type:'file', accept:'.xlsx,.xls', className:'hidden', onChange:e=>onUploadChecklist(e.target.files?.[0])})
+              ),
+              React.createElement('button', {className:'px-3 py-1.5 bg-emerald-600 rounded-xl text-sm hover:bg-emerald-500 text-white', onClick:onExport, disabled:!fileName}, 'Eksporter (.xlsx)'),
+              React.createElement('label', {className:'flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300'},
+                React.createElement('input', {type:'checkbox', checked:pricesVisible, onChange:e=>setPricesVisible(e.target.checked)}),
+                'Vis pris/sum'
+              ),
+              React.createElement('button', {onClick:()=>setDark(!dark), className:'px-3 py-1.5 bg-zinc-100 dark:bg-zinc-800 rounded-xl text-sm hover:bg-zinc-200 dark:hover:bg-zinc-700'}, dark?'Lys':'Mørk')
+            )
+          )
+        )
+      );
+    }
+
+    function Tabs({tab, setTab}) {
+      const tabs = [
+        ['tell','Varetelling'],
+        ['todo','Sjekklister'],
+        ['cash','Pengetelling'],
+        ['history','Historikk'],
+        ['settings','Innstillinger']
+      ];
+      return (
+        React.createElement('div', {className:'bg-white/60 dark:bg-zinc-950/60 border-b border-zinc-200 dark:border-zinc-800'},
+          React.createElement('div', {className:'max-w-6xl mx-auto px-3 overflow-x-auto'},
+            React.createElement('div', {className:'flex'},
+              tabs.map(([k,label]) => React.createElement('button', {
+                key:k, onClick:()=>setTab(k),
+                className:'px-4 py-3 text-sm border-b-2 '+(tab===k?'border-emerald-500 text-zinc-900 dark:text-white':'border-transparent text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200')
+              }, label))
+            )
+          )
+        )
+      );
+    }
+
+    function Filters({categories, selectedCategory, setSelectedCategory, search, setSearch, showMissing, setShowMissing}) {
+      return (
+        React.createElement('div', {className:'max-w-6xl mx-auto px-3 py-2 grid gap-2'},
+          React.createElement('div', {className:'flex gap-2 flex-wrap items-center'},
+            React.createElement('select', {value:selectedCategory, onChange:e=>setSelectedCategory(e.target.value), className:'px-3 py-2 rounded-xl bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-800 text-sm'},
+              React.createElement('option', {value:''}, 'Type: Alle'),
+              categories.map(c => React.createElement('option', {key:c, value:c}, 'Type: '+c))
+            ),
+            React.createElement('input', {value:search, onChange:e=>setSearch(e.target.value), placeholder:'Søk varenavn / art.nr', className:'flex-1 min-w-[160px] px-3 py-2 rounded-xl bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-800 text-sm'}),
+            React.createElement('label', {className:'flex items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300'},
+              React.createElement('input', {type:'checkbox', checked:showMissing, onChange:e=>setShowMissing(e.target.checked)}),
+              'Manglende tall'
+            )
+          )
+        )
+      );
+    }
+
+    function ItemRow({item, value, textValue, setTextValue, onChangeNumber, pricesVisible, warn, isActive, setActiveRow}) {
+      const [holdTimer, setHoldTimer] = useState(null);
+      const inc = (d) => { const newVal = (Number(value)||0)+d; onChangeNumber(newVal); setTextValue(undefined); };
+      const onPress = (d) => { inc(d); const t = setTimeout(()=>{ const rep = setInterval(()=>inc(d*10),120); setHoldTimer(rep); }, 400); setHoldTimer(t); };
+      const stopPress = () => { if (holdTimer) { clearTimeout(holdTimer); clearInterval(holdTimer); setHoldTimer(null);} };
+      const displayed = (textValue !== undefined) ? textValue : (value ?? '');
+      const onInputChange = (s) => { setTextValue(s); const parsed = parseNbNumber(s); onChangeNumber(parsed); };
+      const onBlur = () => {
+        let s = (textValue ?? '').trim(); if (!s) return;
+        s = s.replace(/\./g, ','); if (/[,.]$/.test(s)) s += '0';
+        const parsed = parseNbNumber(s); if (parsed === undefined) return;
+        onChangeNumber(parsed); setTextValue(s);
+      };
+      const priceInfo = item.prisPerForpakning ? `${nb.format(item.prisPerForpakning)} kr` : '—';
+      return (
+        React.createElement('div', {className:'grid grid-cols-[1fr_auto] sm:grid-cols-[1fr_auto_auto] gap-2 items-center px-3 py-3 border-b border-zinc-200 dark:border-zinc-800 '+(item._utgatt?'opacity-60':''), onClick:()=>setActiveRow(item.rowIndex)},
+          React.createElement('div', {className:'min-w-0'},
+            React.createElement('div', {className:'text-sm font-medium truncate'}, item.navn || '(uten navn)'),
+            React.createElement('div', {className:'text-xs text-zinc-500 dark:text-zinc-400 truncate'}, [item.enhet||'', item.pakningsinfo||''].filter(Boolean).join(' • ')),
+            pricesVisible ? React.createElement('div', {className:'text-xs text-zinc-500 dark:text-zinc-400 mt-0.5'}, `Pris/forp: ${priceInfo}`) : null,
+            warn ? React.createElement('div', {className:'text-xs text-red-600 dark:text-red-400 mt-1'}, 'Uvanlig høy verdi — dobbeltsjekk') : null
+          ),
+          React.createElement('div', {className:'flex items-center justify-end gap-2 select-none no-select tap-highlight-none'},
+            React.createElement('button', {className:'px-3 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-lg',
+              onPointerDown:()=>onPress(-1), onPointerUp:stopPress, onPointerCancel:stopPress, onPointerLeave:stopPress}, '−'),
+            React.createElement('input', {type:'text', inputMode:'decimal',
+              className:'w-28 px-3 py-2 rounded-lg bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700 text-right',
+              value:displayed, onChange:e=>onInputChange(e.target.value), onFocus:()=>setActiveRow(item.rowIndex), onBlur
+            }),
+            React.createElement('button', {className:'px-3 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-lg',
+              onPointerDown:()=>onPress(1), onPointerUp:stopPress, onPointerCancel:stopPress, onPointerLeave:stopPress}, '+')
+          )
+        )
+      );
+    }
+
+    function ItemList({items, counts, setCounts, countsText, setCountsText, pricesVisible, threshold, activeRow, setActiveRow}) {
+      useEffect(() => {
+        function onKey(e){
+          if (!activeRow) return;
+          const idx = items.findIndex(it => it.rowIndex === activeRow); if (idx < 0) return;
+          const item = items[idx];
+          if (e.key === '+') { e.preventDefault(); setCounts(p=>({...p, [item.rowIndex]:(p[item.rowIndex]||0)+1})); setCountsText(p=>{const n={...p}; delete n[item.rowIndex]; return n;}); }
+          else if (e.key === '-') { e.preventDefault(); setCounts(p=>({...p, [item.rowIndex]:(p[item.rowIndex]||0)-1})); setCountsText(p=>{const n={...p}; delete n[item.rowIndex]; return n;}); }
+          else if (e.key === 'Enter' || e.key === 'ArrowRight') { e.preventDefault(); const next = items[idx+1]; if (next) setActiveRow(next.rowIndex); }
+          else if (e.key === 'ArrowLeft') { const prev = items[idx-1]; if (prev) setActiveRow(prev.rowIndex); }
+        }
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, [activeRow, items, setCounts]);
+
+      return (
+        React.createElement('div', {className:'max-w-6xl mx-auto'},
+          items.map(it => {
+            const v = counts[it.rowIndex] ?? it.antall ?? undefined;
+            const warn = it.prisPerForpakning && v && (it.prisPerForpakning * v > threshold);
+            const setNumber = (nv) => setCounts(prev => ({...prev, [it.rowIndex]: nv}));
+            const setText = (tv) => setCountsText(prev => ({...prev, [it.rowIndex]: tv}));
+            return React.createElement(ItemRow, {
+              key:it.rowIndex, item:it, value:v, textValue:countsText[it.rowIndex],
+              setTextValue:setText, onChangeNumber:setNumber, pricesVisible, warn,
+              isActive: activeRow === it.rowIndex, setActiveRow
+            });
+          })
+        )
+      );
+    }
+
+    function MissingPanel({items, counts}) {
+      const missing = items.filter(it => (counts[it.rowIndex]??it.antall) === undefined);
+      if (missing.length === 0) return null;
+      return React.createElement('div', {className:'max-w-6xl mx-auto px-3 py-2'},
+        React.createElement('div', {className:'text-sm text-zinc-700 dark:text-zinc-300'}, `Manglende tall: ${missing.length} rader`)
+      );
+    }
+
+    // -------- CashCounter --------
+    function CashCounter({cash, setCash, rollValues, setRollValues}){
+      const COINS=[1,5,10,20], NOTES=[50,100,200,500,1000], DENOMS=[...COINS,...NOTES], ROLLS=[1,5,10,20];
+      const isCoin = (d)=>COINS.includes(d);
+      const getVal=(k,d)=> isCoin(d)?(cash[k].coins[d]||0):(cash[k].notes[d]||0);
+      const setVal=(k,d,val)=>{ val=Math.max(0,Math.floor(Number(val)||0)); setCash(prev=>({...prev,[k]:{coins:{...prev[k].coins,...(isCoin(d)?{[d]:val}:{})},notes:{...prev[k].notes,...(!isCoin(d)?{[d]:val}:{})}}})); };
+      const bump=(k,d,delta)=> setVal(k,d,getVal(k,d)+delta);
+      const subtotal=(k)=>{ let s=0; for (const [v,n] of Object.entries(cash[k].coins)) s+=Number(v)*Number(n||0); for (const [v,n] of Object.entries(cash[k].notes)) s+=Number(v)*Number(n||0); return s; };
+      const setRoll=(denom,val)=>{ val=Math.max(0,Math.floor(Number(val)||0)); setCash(prev=>({...prev,rolls:{...prev.rolls,[denom]:val}})); };
+      const bumpRoll=(denom,delta)=> setRoll(denom,(cash.rolls[denom]||0)+delta);
+      const safeTotal=()=> ROLLS.reduce((s,d)=> s + (Number(rollValues[d]||0)*Number(cash.rolls[d]||0)), 0);
+      const k1Total=subtotal('k1'), k2Total=subtotal('k2'), safe=safeTotal(), grand=k1Total+k2Total+safe;
+
+      function DenomRow({label, value, onChange, onInc}) {
+        const [holdTimer, setHoldTimer] = useState(null);
+        const startPress=(delta)=>{ onInc(delta); const t=setTimeout(()=>{ const rep=setInterval(()=>onInc(delta*10),120); setHoldTimer(rep); },400); setHoldTimer(t); };
+        const stopPress=()=>{ if (holdTimer){ clearTimeout(holdTimer); clearInterval(holdTimer); setHoldTimer(null);} };
+        return (
+          React.createElement('div', {className:'grid grid-cols-[1fr_auto_auto_auto] gap-2 items-center p-2 rounded-lg bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800'},
+            React.createElement('div', {className:'text-sm text-zinc-800 dark:text-zinc-200'}, label),
+            React.createElement('button', {className:'px-3 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-lg',
+              onPointerDown:()=>startPress(-1), onPointerUp:stopPress, onPointerCancel:stopPress, onPointerLeave:stopPress}, '−'),
+            React.createElement('input', {type:'number', inputMode:'numeric', min:0, step:1,
+              className:'w-24 px-3 py-2 rounded-lg bg-white dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-800 text-right',
+              value:value ?? 0, onChange:e=>onChange(Math.max(0,Math.floor(Number(e.target.value)||0))) }),
+            React.createElement('button', {className:'px-3 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-lg',
+              onPointerDown:()=>startPress(1), onPointerUp:stopPress, onPointerCancel:stopPress, onPointerLeave:stopPress}, '+')
+          )
+        );
+      }
+
+      const Card=({title,children,footer})=>React.createElement('div',{className:'p-3 rounded-xl bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800'},
+        React.createElement('div',{className:'text-sm mb-2 text-zinc-700 dark:text-zinc-300'},title),children,
+        footer?React.createElement('div',{className:'mt-2 text-right text-sm text-zinc-700 dark:text-zinc-300'},footer):null
+      );
+
+      const Kasse=({label,keyName})=>(
+        React.createElement('div',{className:'grid gap-3'},
+          React.createElement(Card,{title:`${label} – mynter & sedler`},
+            React.createElement('div',{className:'grid gap-2'},
+              DENOMS.map(d=>React.createElement(DenomRow,{key:d,label:`${d} kr`, value:isCoin(d)?cash[keyName].coins[d]:cash[keyName].notes[d], onChange:v=>setVal(keyName,d,v), onInc:delta=>bump(keyName,d,delta)}))
+            )
+          ),
+          React.createElement('div',{className:'text-right text-sm text-zinc-700 dark:text-zinc-300'},`Delsum ${label}: ${nb.format(subtotal(keyName))} kr`)
+        )
+      );
+
+      return (
+        React.createElement('div',{className:'max-w-5xl mx-auto p-3 grid gap-3'},
+          React.createElement('div',{className:'grid md:grid-cols-2 gap-3'},
+            React.createElement(Kasse,{label:'Kasse 1',keyName:'k1'}),
+            React.createElement(Kasse,{label:'Kasse 2',keyName:'k2'})
+          ),
+          React.createElement('div',{className:'grid gap-3'},
+            React.createElement('div',{className:'p-3 rounded-xl bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800'},
+              React.createElement('div',{className:'text-sm mb-2 text-zinc-700 dark:text-zinc-300'},'Safe (ruller)'),
+              React.createElement('div',{className:'grid gap-2'},
+                [1,5,10,20].map(v=>React.createElement(DenomRow,{key:'r'+v,label:`${v} kr – ruller (verdi/rull: ${nb.format(rollValues[v]||0)} kr)`, value:cash.rolls[v]??0, onChange:val=>setRoll(v,val), onInc:delta=>bumpRoll(v,delta)}))
+              ),
+              React.createElement('div',{className:'mt-3 grid grid-cols-2 sm:grid-cols-4 gap-2'},
+                [1,5,10,20].map(v=>React.createElement('label',{key:'rv'+v,className:'block text-xs text-zinc-700 dark:text-zinc-300'},`Verdi per rull – ${v} kr`,
+                  React.createElement('input',{type:'number',min:0,step:1,className:'mt-1 w-full px-2 py-2 rounded-lg bg-white dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-800 text-right',
+                    value:rollValues[v]??0, onChange:e=>setRollValues(prev=>({...prev,[v]:Math.max(0,Math.floor(Number(e.target.value)||0))}))})
+                ))
+              ),
+              React.createElement('div',{className:'mt-2 text-right text-sm text-zinc-700 dark:text-zinc-300'},`Delsum Safe: ${nb.format(safe)} kr`)
+            )
+          ),
+          React.createElement('div',{className:'flex flex-col sm:flex-row gap-2 sm:items-center sm:justify-between'},
+            React.createElement('div',{className:'text-sm text-zinc-700 dark:text-zinc-300'},`Kasse 1: ${nb.format(k1Total)} kr • Kasse 2: ${nb.format(k2Total)} kr • Safe: ${nb.format(safe)} kr`),
+            React.createElement('div',{className:'text-2xl font-semibold'}, nb.format(grand)+' kr')
+          ),
+          React.createElement('div',{className:'flex gap-2'},
+            React.createElement('button',{className:'px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white', onClick:()=>{
+              const rows=[['Seksjon','Type','Valør','Antall','Sum']];
+              for (const [v,n] of Object.entries(cash.k1.coins)) rows.push(['Kasse 1','Mynt',v,n,Number(v)*Number(n||0)]);
+              for (const [v,n] of Object.entries(cash.k1.notes)) rows.push(['Kasse 1','Seddel',v,n,Number(v)*Number(n||0)]);
+              rows.push(['Kasse 1','','','Delsum',k1Total]);
+              for (const [v,n] of Object.entries(cash.k2.coins)) rows.push(['Kasse 2','Mynt',v,n,Number(v)*Number(n||0)]);
+              for (const [v,n] of Object.entries(cash.k2.notes)) rows.push(['Kasse 2','Seddel',v,n,Number(v)*Number(n||0)]);
+              rows.push(['Kasse 2','','','Delsum',k2Total]);
+              for (const v of [1,5,10,20]) { const n=Number(cash.rolls[v]||0); rows.push(['Safe','Rull',v,n,n*Number(rollValues[v]||0)]); }
+              rows.push(['Safe','','','Delsum',safe]); rows.push(['Total','','','',k1Total+k2Total+safe]); exportCSV('pengetelling.csv', rows);
+            }},'Eksporter CSV')
+          )
+        )
+      );
+    }
+
+    function Checklist({checklist, setChecklist}){
+      const done = checklist.filter(c=>!!c.check).length;
+      return (
+        React.createElement('div',{className:'max-w-3xl mx-auto p-3'},
+          React.createElement('div',{className:'mb-2 text-sm text-zinc-700 dark:text-zinc-300'},`Progresjon: ${done}/${checklist.length}`),
+          React.createElement('div',{className:'grid gap-2'},
+            checklist.map((row,i)=>React.createElement('div',{key:i,className:'grid grid-cols-[auto_1fr] gap-3 items-center p-3 rounded-xl bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800'},
+              React.createElement('input',{type:'checkbox',checked:!!row.check,onChange:e=>{ const next=checklist.slice(); next[i]={...row,check:e.target.checked}; setChecklist(next); }}),
+              React.createElement('div',null,
+                React.createElement('div',{className:'text-sm font-medium'},row.task||'—'),
+                React.createElement('input',{className:'mt-1 w-full px-3 py-2 rounded-lg bg-white dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-800 text-sm', placeholder:'Kommentar', value:row.comment||'', onChange:e=>{ const next=checklist.slice(); next[i]={...row,comment:e.target.value}; setChecklist(next); }})
+              )
+            ))
+          )
+        )
+      );
+    }
+
+    function History({history}){
+      return (
+        React.createElement('div',{className:'max-w-5xl mx-auto p-3'},
+          history.length===0 ? React.createElement('div',{className:'text-sm text-zinc-700 dark:text-zinc-300'},'Ingen historikk ennå.') :
+          React.createElement('div',{className:'grid gap-2'},
+            history.map(h=>React.createElement('div',{key:h.id,className:'p-3 rounded-xl bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800'},
+              React.createElement('div',{className:'flex items-center justify-between'},
+                React.createElement('div',{className:'text-sm'},`${h.monthYear} – ${h.fileName}`),
+                React.createElement('button',{className:'px-3 py-1.5 rounded-lg bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 text-sm',onClick:()=>{
+                  const rows=[['Kategori','Vare (art.nr)','Antall','Pris/forp','Verdi']];
+                  for (const it of h.items||[]) rows.push([it.kategori,`${it.navn} (${it.artikkelnummer})`,it.antall??'',it.prisPerForpakning??'',(it.antall&&it.prisPerForpakning)?(it.antall*it.prisPerForpakning):'']);
+                  rows.push(['','','Total','',h.total||'']); exportCSV(`historikk_${h.monthYear}.csv`, rows);
+                }},'Eksporter CSV')
+              ),
+              React.createElement('div',{className:'text-xs text-zinc-500 dark:text-zinc-400 mt-1'},`Oppdatert ${new Date(h.updatedAt).toLocaleString('nb-NO')}`)
+            ))
+          )
+        )
+      );
+    }
+
+    function App(){
+      const [dark, setDark] = useState(true);
+      useEffect(()=>{ document.documentElement.classList.toggle('dark', dark); },[dark]);
+
+      const [tab, setTab] = useState('tell');
+      const [pricesVisible, setPricesVisible] = useState(false);
+      const [threshold, setThreshold] = useState(1000);
+
+      const [workbook, setWorkbook] = useState(null);
+      const [workbookB64, setWorkbookB64] = useState('');
+      const [sheetName, setSheetName] = useState('');
+      const [headerRow, setHeaderRow] = useState(null);
+      const [headerMap, setHeaderMap] = useState(null);
+      const [items, setItems] = useState([]);
+      const [fileName, setFileName] = useState('');
+      const [sessionKey, setSessionKey] = useState('');
+
+      const [counts, setCounts] = useState({});
+      const [countsText, setCountsText] = useState({});
+      const [activeRow, setActiveRow] = useState(null);
+
+      const [search, setSearch] = useState('');
+      const [selectedCategory, setSelectedCategory] = useState('');
+      const [showMissing, setShowMissing] = useState(false);
+
+      const [checklist, setChecklist] = useState([
+        {check:false, task:'Tell kjøl', comment:''},
+        {check:false, task:'Tell frys', comment:''},
+        {check:false, task:'Tell tørr', comment:''},
+        {check:false, task:'Oppdater Excel og eksporter', comment:''},
+      ]);
+
+      const COINS=[1,5,10,20], NOTES=[50,100,200,500,1000];
+      const emptyKV=(arr)=>Object.fromEntries(arr.map(v=>[v,0]));
+      const [cash, setCash] = useState({
+        k1:{coins:emptyKV(COINS),notes:emptyKV(NOTES)},
+        k2:{coins:emptyKV(COINS),notes:emptyKV(NOTES)},
+        rolls:{1:0,5:0,10:0,20:0}
+      });
+      const [rollValues, setRollValues] = useState({1:50,5:250,10:500,20:500});
+
+      const [savedFlag, setSavedFlag] = useState('');
+
+      // -------- Autosave ASAP (på hver state-endring som betyr noe) --------
+      useEffect(() => {
+        if (!sessionKey) return;
+        const payload = {
+          sessionKey, fileName,
+          monthYear: new Date().toLocaleDateString('nb-NO', {year:'numeric', month:'long'}),
+          counts, countsText, threshold, pricesVisible, itemsSnapshot: items,
+          cash, rollValues, checklist,
+          workbookB64, sheetName, headerRow, headerMap,
+          updatedAt: nowISO()
+        };
+        db.sessions.where('sessionKey').equals(sessionKey).first().then(row => {
+          if (row) return db.sessions.update(row.id, payload);
+          else return db.sessions.add(payload);
+        }).then(()=>{ setSavedFlag('Lagret'); setTimeout(()=>setSavedFlag(''), 900); });
+      }, [sessionKey, fileName, items, counts, countsText, threshold, pricesVisible, cash, rollValues, checklist, workbookB64, sheetName, headerRow, headerMap]);
+
+      // Last forrige økt automatisk ved oppstart ("Fortsett der du slapp")
+      useEffect(() => {
+        (async () => {
+          const last = await db.sessions.orderBy('updatedAt').last();
+          if (!last) return;
+          setSessionKey(last.sessionKey); setFileName(last.fileName||'');
+          setCounts(last.counts||{}); setCountsText(last.countsText||{});
+          setThreshold(last.threshold||1000); setPricesVisible(!!last.pricesVisible);
+          setChecklist(last.checklist || []);
+          if (last.cash) setCash(last.cash); if (last.rollValues) setRollValues(last.rollValues);
+          if (last.workbookB64) {
+            try {
+              const ab = b642ab(last.workbookB64);
+              const wb = XLSX.read(ab,{type:'array'}); setWorkbook(wb); setWorkbookB64(last.workbookB64);
+              // Re-parse for sikkerhets skyld (i tilfelle formater ble endret)
+              const parsed = parseItems(wb);
+              setItems(parsed.items); setSheetName(parsed.sheetName); setHeaderRow(parsed.headerRow); setHeaderMap(parsed.headerMap);
+            } catch (e) {
+              console.warn('Kunne ikke gjenopprette workbook fra lagring:', e);
+              if (Array.isArray(last.itemsSnapshot) && last.itemsSnapshot.length) setItems(last.itemsSnapshot);
+              setSheetName(last.sheetName||''); setHeaderRow(last.headerRow||null); setHeaderMap(last.headerMap||null);
+            }
+          } else if (Array.isArray(last.itemsSnapshot) && last.itemsSnapshot.length) {
+            setItems(last.itemsSnapshot); setSheetName(last.sheetName||''); setHeaderRow(last.headerRow||null); setHeaderMap(last.headerMap||null);
+          }
+        })();
+      }, []);
+
+      async function onUploadExcel(file) {
+        if (!file) return;
+        const ab = await file.arrayBuffer();
+        const wb = XLSX.read(ab, {type:'array'});
+        const parsed = parseItems(wb);
+        setWorkbook(wb);
+        setWorkbookB64(ab2b64(ab)); // ← lagre original-fila lokalt for eksport etter reload
+        setItems(parsed.items);
+        setSheetName(parsed.sheetName);
+        setHeaderRow(parsed.headerRow);
+        setHeaderMap(parsed.headerMap);
+        setFileName(file.name);
+        setSessionKey(fileHashName(file));
+        const initial = {}; for (const it of parsed.items) if (it.antall !== undefined) initial[it.rowIndex] = it.antall;
+        setCounts(initial); setCountsText({});
+      }
+
+      async function onUploadChecklist(file) {
+        if (!file) return;
+        const ab = await file.arrayBuffer();
+        const wb = XLSX.read(ab, {type:'array'});
+        const ws = wb.Sheets['Ark1'] || wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(ws, {header:1});
+        const hdr = (rows[0]||[]).map(x=>normalize(x));
+        const iCheck = hdr.findIndex(h=>h.includes('CHECK'));
+        const iTask  = hdr.findIndex(h=>h.includes('VARETELLING'));
+        const iCom   = hdr.findIndex(h=>h.includes('KOMMENTAR'));
+        const arr = [];
+        for (let i=1;i<rows.length;i++){ const r=rows[i]; if (!r) continue; arr.push({check:!!r[iCheck], task:r[iTask]||'', comment:r[iCom]||''}); }
+        if (arr.length) setChecklist(arr);
+      }
+
+      const categories = useMemo(() => Array.from(new Set(items.map(i=>i.kategori).filter(Boolean))), [items]);
+
+      const filtered = useMemo(() => {
+        let list = items;
+        if (selectedCategory) list = list.filter(i=>i.kategori===selectedCategory);
+        if (search.trim()) {
+          const q = normalize(search);
+          list = list.filter(i => normalize(i.navn).includes(q) || normalize(i.artikkelnummer).includes(q));
+        }
+        if (showMissing) list = list.filter(i => (counts[i.rowIndex]??i.antall) === undefined);
+        return list;
+      }, [items, selectedCategory, search, showMissing, counts]);
+
+      async function onExport() {
+        if (!workbook) { alert('Last opp Excel først (eller gjenopprett lokal lagring).'); return; }
+        const f = await applyCountsAndExport(workbook, counts, sheetName, headerRow, headerMap);
+        const url = URL.createObjectURL(f); const a=document.createElement('a');
+        a.href=url; a.download=(fileName||'Varetelling') .replace(/\.xlsx?$/i,'')+'_EKSPORT.xlsx'; a.click(); URL.revokeObjectURL(url);
+        alert('Eksport fullført');
+        const total = items.reduce((s,it)=>{ const v=counts[it.rowIndex]??it.antall; if (v==null||v==='') return s; const p=it.prisPerForpakning||0; return s+v*p; },0);
+        const snapshot = {fileName, monthYear: new Date().toLocaleDateString('nb-NO',{year:'numeric',month:'long'}),
+          items: items.map(it=>({kategori:it.kategori, artikkelnummer:it.artikkelnummer, navn:it.navn, antall:counts[it.rowIndex]??it.antall, prisPerForpakning:it.prisPerForpakning})),
+          total, updatedAt: nowISO()};
+        await db.history.add(snapshot);
+      }
+
+      // Backup/restore av hele lokale data
+      async function exportBackup() {
+        const sessions = await db.sessions.toArray();
+        const history = await db.history.toArray();
+        const payload = { exportedAt: nowISO(), sessions, history, version: 1 };
+        const blob = new Blob([JSON.stringify(payload)], {type:'application/json'});
+        const url = URL.createObjectURL(blob); const a=document.createElement('a');
+        a.href=url; a.download='varetelling_backup.json'; a.click(); URL.revokeObjectURL(url);
+      }
+      async function importBackup(file) {
+        if (!file) return;
+        try {
+          const text = await file.text(); const data = JSON.parse(text);
+          if (!data || !Array.isArray(data.sessions)) throw new Error('Ugyldig backup');
+          await db.transaction('rw', db.sessions, db.history, async () => {
+            for (const s of data.sessions) { // upsert by sessionKey
+              const existing = await db.sessions.where('sessionKey').equals(s.sessionKey).first();
+              if (existing) await db.sessions.update(existing.id, s); else await db.sessions.add(s);
+            }
+            for (const h of (data.history||[])) await db.history.add(h);
+          });
+          alert('Backup importert. Last siden for å ta i bruk siste økt.');
+        } catch (e) {
+          alert('Klarte ikke å importere backup: '+e.message);
+        }
+      }
+
+      return (
+        React.createElement(React.Fragment,null,
+          React.createElement(TopBar,{dark,setDark,onUploadExcel,onUploadChecklist,fileName,onExport,pricesVisible,setPricesVisible}),
+          React.createElement(Tabs,{tab,setTab}),
+          tab==='tell' && (
+            React.createElement('div',null,
+              React.createElement(Filters,{categories,selectedCategory,setSelectedCategory,search,setSearch,showMissing,setShowMissing}),
+              React.createElement(MissingPanel,{items,counts}),
+              React.createElement('div',{className:'max-w-6xl mx-auto px-3'},
+                React.createElement('div',{className:'flex items-center justify-between text-sm text-zinc-700 dark:text-zinc-300 mb-2'},
+                  React.createElement('div',null, items.length? `${filtered.length} av ${items.length} varer` : 'Last opp varetellings-Excel'),
+                  React.createElement('div',{className:'text-emerald-600 dark:text-emerald-400'}, savedFlag)
+                )
+              ),
+              React.createElement(ItemList,{items:filtered,counts,setCounts,countsText,setCountsText,pricesVisible,threshold,activeRow,setActiveRow}),
+              React.createElement('div',{className:'sticky bottom-0 bg-white/80 dark:bg-zinc-900/80 border-t border-zinc-200 dark:border-zinc-800 backdrop-blur'},
+                React.createElement('div',{className:'max-w-6xl mx-auto px-3 py-2 flex items-center gap-2'},
+                  React.createElement('button',{className:'px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700', onClick:()=>{
+                    if (!activeRow) return; const i=filtered.findIndex(it=>it.rowIndex===activeRow); if (i>0) setActiveRow(filtered[i-1].rowIndex);
+                  }},'Forrige'),
+                  React.createElement('button',{className:'px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700', onClick:()=>{
+                    if (!activeRow) { if (filtered[0]) setActiveRow(filtered[0].rowIndex); return; }
+                    const i=filtered.findIndex(it=>it.rowIndex===activeRow); if (i>=0 && i<filtered.length-1) setActiveRow(filtered[i+1].rowIndex);
+                  }},'Neste'),
+                  React.createElement('div',{className:'ml-auto flex items-center gap-3 text-sm text-zinc-700 dark:text-zinc-300'},
+                    React.createElement('label',{className:'flex items-center gap-2'},'Terskel', React.createElement('input',{type:'number',className:'w-24 px-2 py-1 rounded-lg bg-white dark:bg-zinc-950 border border-zinc-300 dark:border-zinc-800 text-right', value:threshold, onChange:e=>setThreshold(Number(e.target.value)||0)})),
+                    React.createElement('button',{className:'px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white', onClick:onExport},'Fullfør & eksporter')
+                  )
+                )
+              )
+            )
+          ),
+          tab==='todo' && React.createElement(Checklist,{checklist,setChecklist}),
+          tab==='cash' && React.createElement(CashCounter,{cash,setCash,rollValues,setRollValues}),
+          tab==='history' && React.createElement(History,{history: []}),
+          tab==='settings' && (
+            React.createElement('div',{className:'max-w-3xl mx-auto p-3 grid gap-3'},
+              React.createElement('div',{className:'text-sm text-zinc-700 dark:text-zinc-300'}, 'Ingen backend. All lagring skjer lokalt i denne nettleseren, og overlever reload og offline.'),
+              React.createElement('div',{className:'text-xs text-zinc-500 dark:text-zinc-400'}, 'Vil du dele data mellom enheter/brukere? Bruk backup/import her – eller vi kan senere aktivere Supabase for autosync.'),
+              React.createElement('div',{className:'flex gap-2'},
+                React.createElement('button',{className:'px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700', onClick:exportBackup},'Eksporter lokal backup (.json)'),
+                React.createElement('label',{className:'px-3 py-2 rounded-xl bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 cursor-pointer'},
+                  'Importer backup',
+                  React.createElement('input',{type:'file',accept:'.json',className:'hidden', onChange:e=>importBackup(e.target.files?.[0])})
+                )
+              )
+            )
+          )
+        )
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('app')).render(React.createElement(App));
+
+    // ------------------------------- Self-tests -------------------------------
+    (function selfTests(){
+      console.group('%cSelf-tests','color:#16a34a;font-weight:bold');
+      const ok=(name,cond)=>{ if(!cond){ console.error('❌ '+name); throw new Error('❌ '+name);} else console.log('✅ '+name); };
+
+      // parseNbNumber & normalize
+      ok('parseNbNumber("1 234,5") == 1234.5', parseNbNumber('1 234,5') === 1234.5);
+      ok('parseNbNumber("12,") === 12', parseNbNumber('12,') === 12);
+      ok('parseNbNumber("12.") === 12', parseNbNumber('12.') === 12);
+      ok('normalize("  Meieri  &  Kjølevarer  ") == "MEIERI & KJØLEVARER"', normalize('  Meieri  &  Kjølevarer  ') === 'MEIERI & KJØLEVARER');
+
+      // Vare-/kategori-logikk (enkle sanity checks)
+      ok('isVareRow("12345") === true', isVareRow('12345') === true);
+      ok('isVareRow("") === false', isVareRow('') === false);
+      ok('isKategoriRow(undefined,"MEIERI") === true', isKategoriRow(undefined,'MEIERI') === true);
+
+      // Base64 runde-trip for workbook-lagring
+      const bytes = new Uint8Array([0,1,2,3,254,255]).buffer;
+      const b64 = ab2b64(bytes);
+      const back = b642ab(b64);
+      ok('b64 roundtrip length', back.byteLength === bytes.byteLength);
+
+      // Flere tall-caser
+      ok('parseNbNumber("1 234") == 1234', parseNbNumber('1 234') === 1234);
+      ok('parseNbNumber("1,234") == 1.234', parseNbNumber('1,234') === 1.234);
+      ok('parseNbNumber("1 234,56") == 1234.56', parseNbNumber('1 234,56') === 1234.56);
+      ok('parseNbNumber("") === undefined', parseNbNumber('') === undefined);
+      ok('parseNbNumber("abc") === undefined', parseNbNumber('abc') === undefined);
+      ok('parseNbNumber(-12) == -12', parseNbNumber(-12) === -12);
+      console.groupEnd();
+    })();
+  })();
+  </script>
+</body>
+</html>
